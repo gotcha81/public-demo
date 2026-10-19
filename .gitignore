@@ -1,0 +1,19 @@
+# Secrets - must never leave this machine
+resource_root/credentials/
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.idea/
+
+# Script output
+*.log
+*.egg-info/
+build/
+dist/

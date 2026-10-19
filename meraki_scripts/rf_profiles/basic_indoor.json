@@ -1,0 +1,28 @@
+{
+  "_note": "Starting point modelled on Meraki's Basic Indoor Profile. Rename and tune before uploading. For Meraki's exact current defaults run export_rf_profile.py. 5 GHz channels are the EU set (no 144/149-165).",
+  "name": "Custom Indoor",
+  "bandSelectionType": "ap",
+  "clientBalancingEnabled": true,
+  "minBitrateType": "band",
+  "apBandSettings": {
+    "bandOperationMode": "dual",
+    "bandSteeringEnabled": true
+  },
+  "twoFourGhzSettings": {
+    "minPower": 5,
+    "maxPower": 30,
+    "minBitrate": 11,
+    "validAutoChannels": [1, 6, 11],
+    "axEnabled": true
+  },
+  "fiveGhzSettings": {
+    "minPower": 8,
+    "maxPower": 30,
+    "minBitrate": 12,
+    "channelWidth": "auto",
+    "validAutoChannels": [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140]
+  },
+  "transmission": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,4 @@
+serial,hostname,network_name,rf_profile_name
+Q2XX-XXXX-XXXX,AP-Lobby-01,Stockholm Office,Custom Indoor
+Q2YY-YYYY-YYYY,AP-Office-02,Stockholm Office,Custom Indoor
+Q2ZZ-ZZZZ-ZZZZ,AP-Warehouse-01,Gothenburg Warehouse,

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "public-demo"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx",
+    "meraki",
+    "requests",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["resource_root*"]
+# Never bundle credentials into a built wheel/sdist; the editable install still finds them on disk
+exclude = ["resource_root.credentials*"]
