@@ -8,6 +8,7 @@ Usage:
     python meraki_scripts/export_rf_profile.py --network "Stockholm Office"
     python meraki_scripts/export_rf_profile.py --network "HQ" --profile "HQ-Indoor" -o hq_indoor.json
     python meraki_scripts/export_rf_profile.py --network "HQ" --new-name "Custom Indoor"
+    python meraki_scripts/export_rf_profile.py --network "HQ" --all   # every profile, to rf_profiles/hq/
 """
 
 import argparse
@@ -41,13 +42,43 @@ def find_profile(dashboard, network_id, name):
     return None
 
 
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def all_profiles(dashboard, network_id):
+    """Every profile in the network, including the built-in basic ones."""
+    profiles = dashboard.wireless.getNetworkWirelessRfProfiles(network_id, includeTemplateProfiles=True)
+    for basic_name, basic_id in BASIC_PROFILE_IDS.items():
+        if not any(p["name"].lower() == basic_name for p in profiles):
+            try:
+                profiles.append(dashboard.wireless.getNetworkWirelessRfProfile(network_id, basic_id))
+            except meraki.APIError as exc:
+                print(f"Could not fetch built-in profile '{basic_id}': {api_error_text(exc)}")
+    return profiles
+
+
+def save_profile(profile, new_name, output):
+    """Write the profile without read-only fields. A built-in profile's name is reserved,
+    so a copy of one gets a different name."""
+    body = {k: v for k, v in profile.items() if k not in RF_PROFILE_READONLY_KEYS}
+    is_basic = profile["name"].lower() in BASIC_PROFILE_IDS
+    body["name"] = new_name or (f"Custom {profile['name']}" if is_basic else profile["name"])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    print(f"Exported '{profile['name']}' to {output} (name in file: '{body['name']}')")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--network", required=True, help="Network to export from")
     parser.add_argument("--profile", default="Basic Indoor Profile", help="Profile name (default: %(default)s)")
+    parser.add_argument("--all", action="store_true",
+                        help="Export every profile in the network to rf_profiles/<network>/ (or -o as a folder)")
     parser.add_argument("--new-name", help="Name to store in the JSON (default: the profile's own name, "
                                            "or 'Custom <name>' for the built-in basic profiles)")
-    parser.add_argument("-o", "--output", help="Output file (default: meraki_scripts/rf_profiles/<name>.json)")
+    parser.add_argument("-o", "--output", help="Output file, or folder with --all "
+                                                "(default: meraki_scripts/rf_profiles/<name>.json)")
     parser.add_argument("--org", help="Organization ID or name (default: MERAKI_ORG_ID or the only org)")
     args = parser.parse_args()
 
@@ -57,22 +88,26 @@ def main():
         net = get_networks_by_name(dashboard, org_id).get(args.network)
         if not net:
             sys.exit(f"Network '{args.network}' not found")
-        profile = find_profile(dashboard, net["id"], args.profile)
+        if args.all:
+            profiles = all_profiles(dashboard, net["id"])
+        else:
+            profile = find_profile(dashboard, net["id"], args.profile)
     except meraki.APIError as exc:
         sys.exit(f"API error: {api_error_text(exc)}")
+
+    if args.all:
+        out_dir = Path(args.output) if args.output else PROFILE_DIR / slug(args.network)
+        for p in profiles:
+            save_profile(p, None, out_dir / f"{slug(p['name'])}.json")
+        print(f"{len(profiles)} profile(s) from '{args.network}' saved in {out_dir}")
+        return
+
     if not profile:
         sys.exit(f"RF profile '{args.profile}' not found in network '{args.network}'")
-
-    body = {k: v for k, v in profile.items() if k not in RF_PROFILE_READONLY_KEYS}
-    # A built-in profile's name is reserved, so a copy needs a different one
     is_basic = args.profile.lower() in BASIC_PROFILE_IDS
-    body["name"] = args.new_name or (f"Custom {args.profile}" if is_basic else profile["name"])
-
-    output = Path(args.output) if args.output else \
-        PROFILE_DIR / (re.sub(r"[^a-z0-9]+", "_", body["name"].lower()).strip("_") + ".json")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
-    print(f"Exported '{args.profile}' from '{args.network}' to {output} (name in file: '{body['name']}')")
+    name = args.new_name or (f"Custom {args.profile}" if is_basic else profile["name"])
+    output = Path(args.output) if args.output else PROFILE_DIR / f"{slug(name)}.json"
+    save_profile(profile, args.new_name, output)
 
 
 if __name__ == "__main__":

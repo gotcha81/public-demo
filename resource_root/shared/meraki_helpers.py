@@ -4,14 +4,20 @@ lookup, CSV reading and logging.
 """
 
 import csv
+import getpass
+import json
 import logging
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import meraki
 
 import resource_root.credentials.my_creds as cred
+
+# Every change (POST/PUT/PATCH/DELETE) any script makes is appended here
+CHANGE_LOG = Path(__file__).resolve().parents[2] / "logs" / "meraki_api_changes.log"
 
 # Fields the API returns for an RF profile that must not be sent back on create/update
 RF_PROFILE_READONLY_KEYS = {"id", "networkId", "isIndoorDefault", "isOutdoorDefault"}
@@ -50,14 +56,59 @@ def setup_logging(name, log_file=None, log_dir=None):
 # --------------------------------------------------------------------------
 # Dashboard API
 # --------------------------------------------------------------------------
+def _change_logger():
+    """Logger that appends to the global change log, shared by all scripts."""
+    log = logging.getLogger("meraki_api_changes")
+    if not log.handlers:
+        CHANGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(CHANGE_LOG, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        log.addHandler(fh)
+        log.setLevel(logging.INFO)
+        log.propagate = False  # keep these lines out of the scripts' own logs/console
+    return log
+
+
+def _log_changes(session):
+    """Wrap the SDK session so every non-GET request is written to the change log."""
+    change_log = _change_logger()
+    script = Path(sys.argv[0]).name or "interactive"
+    user = getpass.getuser()
+    request = session.request
+
+    def logged_request(metadata, method, url, **kwargs):
+        if method == "GET":
+            return request(metadata, method, url, **kwargs)
+        body = json.dumps(kwargs.get("json"), ensure_ascii=False) if kwargs.get("json") is not None else "-"
+        prefix = f"{script} ({user}) {metadata['operation']}: {method} {url} body={body}"
+        try:
+            response = request(metadata, method, url, **kwargs)
+        except meraki.APIError as exc:
+            change_log.info("%s -> FAILED %s", prefix, api_error_text(exc))
+            raise
+        except Exception as exc:
+            change_log.info("%s -> FAILED %s", prefix, exc)
+            raise
+        status = response.status_code if response is not None else "simulated"
+        change_log.info("%s -> OK %s", prefix, status)
+        return response
+
+    session.request = logged_request
+
+
 def get_dashboard():
-    """Return a DashboardAPI session. The SDK retries 429s and transient errors itself."""
-    return meraki.DashboardAPI(
+    """Return a DashboardAPI session. The SDK retries 429s and transient errors itself.
+
+    All changes made through it are logged to CHANGE_LOG.
+    """
+    dashboard = meraki.DashboardAPI(
         cred.my_meraki_api_key,
         suppress_logging=True,  # our own logging covers it, and the SDK log can be noisy
         wait_on_rate_limit=True,
         maximum_retries=5,
     )
+    _log_changes(dashboard._session)
+    return dashboard
 
 
 def api_error_text(exc):
