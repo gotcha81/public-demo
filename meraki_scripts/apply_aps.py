@@ -24,32 +24,75 @@ Usage:
     python meraki_scripts/apply_aps.py aps.csv              # apply
     python meraki_scripts/apply_aps.py aps.csv --move       # also move APs from other networks
     python meraki_scripts/apply_aps.py aps.csv --org "My Org"
+
+How to debug it:
+    1. Check DEBUG_ARGS below (used when the script is started without arguments)
+    2. Put a breakpoint on the first line inside run() (step 1),
+       or inside process_row() to follow a single access point
+    3. Right-click this file -> Debug, or use the "apply_aps (debug, dry-run)" run config
+    4. F8 = run the line, F7 = go into one of the functions below
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 import meraki
 
 from resource_root.shared.meraki_helpers import (
+    ScriptStopped,
     api_error_text,
     get_dashboard,
     get_networks_by_name,
     norm_serial,
     read_csv_rows,
     resolve_org_id,
+    run_script,
     setup_logging,
 )
+
+# --------------------------------------------------------------------------
+# Settings - change these
+# --------------------------------------------------------------------------
+
+# Arguments used when the script is started without any (e.g. Debug in PyCharm).
+# Keep --dry-run here so debugging never changes anything by accident.
+# The example CSV has made-up serials, so expect "not in the organization inventory".
+DEBUG_ARGS = ["meraki_scripts/examples/aps_example.csv", "--dry-run"]
 
 LOG_DIR = Path(__file__).parent / "logs"
 REQUIRED_COLUMNS = ["serial", "hostname", "network_name", "rf_profile_name"]
 
+# Same name as in setup_logging() in main(), so the functions below write to that log
+log = logging.getLogger("apply_aps")
 
-def load_rows(path, log):
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("csv_file", help="CSV with serial,hostname,network_name,rf_profile_name")
+    parser.add_argument("--org", help="Organization ID or name (default: MERAKI_ORG_ID or the only org)")
+    parser.add_argument("--move", action="store_true", help="Move APs that are currently in another network")
+    parser.add_argument("--dry-run", action="store_true", help="Show changes without applying them")
+    parser.add_argument("--log-file", help="Log file path (default: meraki_scripts/logs/apply_aps_<timestamp>.log)")
+
+    command_line = sys.argv[1:] or DEBUG_ARGS
+    args = parser.parse_args(command_line)
+    return args
+
+
+# --------------------------------------------------------------------------
+# Reading data
+# --------------------------------------------------------------------------
+def load_rows(path):
     """Read and validate the CSV. Returns a list of row dicts, last entry wins on duplicate serials."""
+    try:
+        csv_rows = read_csv_rows(path, REQUIRED_COLUMNS)
+    except (OSError, ValueError) as exc:
+        raise ScriptStopped(f"Could not read CSV {path}: {exc}") from exc
+
     rows = {}
-    for line, row in read_csv_rows(path, REQUIRED_COLUMNS):
+    for line, row in csv_rows:
         if not (row["serial"] and row["hostname"] and row["network_name"]):
             log.warning("CSV line %d ignored (serial, hostname and network_name are required): %s", line, row)
             continue
@@ -58,157 +101,208 @@ def load_rows(path, log):
             log.warning("CSV line %d: duplicate serial %s, using this entry instead of the earlier one",
                         line, row["serial"])
         rows[key] = row
+
+    if not rows:
+        raise ScriptStopped(f"No valid rows found in {path}")
     return list(rows.values())
 
 
-class RfProfiles:
-    """Per-network cache of {rf_profile_name: rf_profile_id}."""
-
-    def __init__(self, dashboard):
-        self.dashboard = dashboard
-        self._cache = {}
-
-    def get_id(self, network_id, name):
-        if network_id not in self._cache:
-            profiles = self.dashboard.wireless.getNetworkWirelessRfProfiles(
-                network_id, includeTemplateProfiles=True)
-            self._cache[network_id] = {p["name"]: p["id"] for p in profiles}
-        return self._cache[network_id].get(name)
+def get_inventory(dashboard, org_id):
+    """Return {normalised_serial: device} for every device in the organization's inventory."""
+    devices = dashboard.organizations.getOrganizationInventoryDevices(org_id, total_pages="all")
+    inventory = {norm_serial(d["serial"]): d for d in devices}
+    return inventory
 
 
-def process_row(row, ctx, args, log):
-    """Apply one CSV row. Returns None on success, or a failure reason string."""
-    dashboard, inventory, networks, rf_profiles = ctx
-    serial, hostname = row["serial"], row["hostname"]
-    net_name, rf_name = row["network_name"], row["rf_profile_name"]
+def get_rf_profile_id(dashboard, rf_profile_cache, network_id, name):
+    """Look up an RF profile ID by name. Each network's profiles are fetched only once."""
+    if network_id not in rf_profile_cache:
+        profiles = dashboard.wireless.getNetworkWirelessRfProfiles(network_id, includeTemplateProfiles=True)
+        rf_profile_cache[network_id] = {p["name"]: p["id"] for p in profiles}
+    profile_id = rf_profile_cache[network_id].get(name)
+    return profile_id
 
-    # ---- validate everything first ----
-    dev = inventory.get(norm_serial(serial))
+
+# --------------------------------------------------------------------------
+# One access point: check -> plan -> apply
+# --------------------------------------------------------------------------
+def check_row(row, inventory, networks, args):
+    """Validate one row before anything is changed.
+
+    Returns (device, network, None) if it's OK, or (None, None, reason) if not.
+    """
+    dev = inventory.get(norm_serial(row["serial"]))
     if not dev:
-        return "not in the organization inventory (claim it into the org first)"
-    serial = dev["serial"]  # use the dashboard's own formatting from here on
+        return None, None, "not in the organization inventory (claim it into the org first)"
     if dev.get("productType") != "wireless":
-        return f"not an access point (model {dev.get('model')})"
+        return None, None, f"not an access point (model {dev.get('model')})"
 
+    net_name = row["network_name"]
     net = networks.get(net_name)
     if not net:
-        return f"network '{net_name}' not found"
+        return None, None, f"network '{net_name}' not found"
     if "wireless" not in net.get("productTypes", []):
-        return f"network '{net_name}' has no wireless product type"
-    net_id = net["id"]
+        return None, None, f"network '{net_name}' has no wireless product type"
 
     current_net = dev.get("networkId")
-    if current_net and current_net != net_id and not args.move:
-        return f"is in another network ({current_net}), use --move to move it"
+    if current_net and current_net != net["id"] and not args.move:
+        return None, None, f"is in another network ({current_net}), use --move to move it"
+    return dev, net, None
 
-    rf_id = None
-    if rf_name:
-        rf_id = rf_profiles.get_id(net_id, rf_name)
-        if not rf_id:
-            return f"RF profile '{rf_name}' not found in network '{net_name}' (upload it first)"
 
-    # ---- work out what needs to change ----
-    already_in_net = current_net == net_id
-    actions = []
-    if not already_in_net:
-        actions.append(f"move from {current_net} to '{net_name}'" if current_net else f"claim into '{net_name}'")
+def plan_changes(dashboard, row, dev, net, rf_profile_cache):
+    """Work out what needs to change. Returns (plan, None), or (None, reason) if it can't be done.
+
+    plan is a dict that apply_changes() uses. plan["actions"] is a readable list (empty = nothing to do).
+    """
+    serial = dev["serial"]  # use the dashboard's own formatting from here on
+    hostname, rf_name = row["hostname"], row["rf_profile_name"]
+    current_net = dev.get("networkId")
+    already_in_net = current_net == net["id"]
     old_name = dev.get("name") or ""
+
+    plan = {
+        "serial": serial,
+        "move_from": None,       # network ID to remove the AP from first
+        "claim_into": None,      # network ID to claim the AP into
+        "new_name": None,        # hostname to set
+        "rf_profile_id": None,   # RF profile to assign
+        "actions": [],
+    }
+
+    if not already_in_net:
+        plan["claim_into"] = net["id"]
+        if current_net:
+            plan["move_from"] = current_net
+            plan["actions"].append(f"move from {current_net} to '{net['name']}'")
+        else:
+            plan["actions"].append(f"claim into '{net['name']}'")
+
     if not already_in_net or old_name != hostname:
-        actions.append(f"name '{old_name}' -> '{hostname}'")
-    if rf_id:
+        plan["new_name"] = hostname
+        plan["actions"].append(f"name '{old_name}' -> '{hostname}'")
+
+    if rf_name:
+        rf_id = get_rf_profile_id(dashboard, rf_profile_cache, net["id"], rf_name)
+        if not rf_id:
+            return None, f"RF profile '{rf_name}' not found in network '{net['name']}' (upload it first)"
         current_rf = None
         if already_in_net:
-            current_rf = dashboard.wireless.getDeviceWirelessRadioSettings(serial).get("rfProfileId")
+            radio_settings = dashboard.wireless.getDeviceWirelessRadioSettings(serial)
+            current_rf = radio_settings.get("rfProfileId")
+        # Only assign if it differs (reassigning would clear manual channel/power overrides)
         if str(current_rf) != str(rf_id):
-            actions.append(f"RF profile -> '{rf_name}'")
-        else:
-            rf_id = None  # already correct, don't reassign (that would clear manual overrides)
+            plan["rf_profile_id"] = rf_id
+            plan["actions"].append(f"RF profile -> '{rf_name}'")
 
-    if not actions:
-        log.info("%s (%s): already correct, nothing to do", serial, hostname)
-        return None
-    log.info("%s%s (%s): %s", "[DRY-RUN] " if args.dry_run else "", serial, dev.get("model"), "; ".join(actions))
-    if args.dry_run:
-        return None
+    return plan, None
 
-    # ---- apply ----
+
+def apply_changes(dashboard, plan, row):
+    """Send the planned changes to Meraki. Returns None on success, or a failure reason."""
+    serial = plan["serial"]
     step = "network"
     try:
-        if not already_in_net:
-            if current_net:
-                dashboard.networks.removeNetworkDevices(current_net, serial)
-                log.info("%s: OK removed from network %s", serial, current_net)
-            dashboard.networks.claimNetworkDevices(net_id, serials=[serial])
-            log.info("%s: OK claimed into '%s'", serial, net_name)
+        if plan["move_from"]:
+            dashboard.networks.removeNetworkDevices(plan["move_from"], serial)
+            log.info("%s: OK removed from network %s", serial, plan["move_from"])
+        if plan["claim_into"]:
+            dashboard.networks.claimNetworkDevices(plan["claim_into"], serials=[serial])
+            log.info("%s: OK claimed into '%s'", serial, row["network_name"])
+
         step = "hostname"
-        if not already_in_net or old_name != hostname:
-            dashboard.devices.updateDevice(serial, name=hostname)
-            log.info("%s: OK name set to '%s'", serial, hostname)
+        if plan["new_name"]:
+            dashboard.devices.updateDevice(serial, name=plan["new_name"])
+            log.info("%s: OK name set to '%s'", serial, plan["new_name"])
+
         step = "RF profile"
-        if rf_id:
-            dashboard.wireless.updateDeviceWirelessRadioSettings(serial, rfProfileId=rf_id)
-            log.info("%s: OK RF profile '%s' assigned", serial, rf_name)
+        if plan["rf_profile_id"]:
+            dashboard.wireless.updateDeviceWirelessRadioSettings(serial, rfProfileId=plan["rf_profile_id"])
+            log.info("%s: OK RF profile '%s' assigned", serial, row["rf_profile_name"])
     except meraki.APIError as exc:
-        log.error("%s: FAILED at %s step: %s", serial, step, api_error_text(exc))
         return f"failed at {step} step: {api_error_text(exc)}"
     return None
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("csv_file", help="CSV with serial,hostname,network_name,rf_profile_name")
-    parser.add_argument("--org", help="Organization ID or name (default: MERAKI_ORG_ID or the only org)")
-    parser.add_argument("--move", action="store_true", help="Move APs that are currently in another network")
-    parser.add_argument("--dry-run", action="store_true", help="Show changes without applying them")
-    parser.add_argument("--log-file", help="Log file path (default: meraki_scripts/logs/apply_aps_<timestamp>.log)")
-    args = parser.parse_args()
-
-    log, log_file = setup_logging("apply_aps", args.log_file, LOG_DIR)
-    log.info("=== Apply APs started%s ===", " (DRY RUN)" if args.dry_run else "")
+def process_row(dashboard, row, inventory, networks, rf_profile_cache, args):
+    """Check, plan and apply one CSV row. Returns None on success, or a failure reason."""
+    dev, net, reason = check_row(row, inventory, networks, args)
+    if reason:
+        return reason
 
     try:
-        rows = load_rows(args.csv_file, log)
-    except (OSError, ValueError) as exc:
-        log.critical("Could not read CSV: %s", exc)
-        sys.exit(1)
-    if not rows:
-        log.critical("No valid rows found in the CSV")
-        sys.exit(1)
-    log.info("Loaded %d access points from %s", len(rows), args.csv_file)
-
-    try:
-        dashboard = get_dashboard()
-        org_id = resolve_org_id(dashboard, args.org)
-        log.info("Organization %s: fetching networks and inventory...", org_id)
-        networks = get_networks_by_name(dashboard, org_id)
-        inventory = {norm_serial(d["serial"]): d for d in
-                     dashboard.organizations.getOrganizationInventoryDevices(org_id, total_pages="all")}
-        log.info("%d networks, %d devices in inventory", len(networks), len(inventory))
+        plan, reason = plan_changes(dashboard, row, dev, net, rf_profile_cache)
     except meraki.APIError as exc:
-        log.critical("Could not read organization data: %s", api_error_text(exc))
-        sys.exit(1)
+        return f"could not read current settings: {api_error_text(exc)}"
+    if reason:
+        return reason
 
-    ctx = (dashboard, inventory, networks, RfProfiles(dashboard))
+    serial = plan["serial"]
+    if not plan["actions"]:
+        log.info("%s (%s): already correct, nothing to do", serial, row["hostname"])
+        return None
+    prefix = "[DRY-RUN] " if args.dry_run else ""
+    log.info("%s%s (%s): %s", prefix, serial, dev.get("model"), "; ".join(plan["actions"]))
+    if args.dry_run:
+        return None
+
+    reason = apply_changes(dashboard, plan, row)
+    return reason
+
+
+# --------------------------------------------------------------------------
+# Main flow
+# --------------------------------------------------------------------------
+def run(args):
+    # Step 1: read the CSV
+    rows = load_rows(args.csv_file)
+    log.info("Step 1: Loaded %d access point(s) from %s", len(rows), args.csv_file)
+
+    # Step 2: connect and find the organization
+    log.info("Step 2: Connecting to Meraki...")
+    dashboard = get_dashboard()
+    org_id = resolve_org_id(dashboard, args.org)
+    log.info("Step 2: Organization %s", org_id)
+
+    # Step 3: get networks and inventory
+    networks = get_networks_by_name(dashboard, org_id)
+    inventory = get_inventory(dashboard, org_id)
+    log.info("Step 3: %d networks, %d devices in inventory", len(networks), len(inventory))
+
+    # Step 4: handle each access point (one failure does not stop the others)
+    log.info("Step 4: Processing access points...")
+    rf_profile_cache = {}
     ok, failed = 0, []
     for row in rows:
         try:
-            reason = process_row(row, ctx, args, log)
+            reason = process_row(dashboard, row, inventory, networks, rf_profile_cache, args)
         except Exception as exc:  # one bad AP must not stop the run
             log.exception("%s: UNEXPECTED ERROR", row["serial"])
             reason = f"unexpected error: {exc}"
         if reason:
-            if not reason.startswith("failed at"):  # API failures are already logged
-                log.error("%s: SKIPPED - %s", row["serial"], reason)
+            log.error("%s: FAILED - %s", row["serial"], reason)
             failed.append((row["serial"], reason))
         else:
             ok += 1
 
-    log.info("=== Done: %d OK, %d with problems ===", ok, len(failed))
+    # Step 5: summary
+    log.info("Step 5: Done: %d OK, %d with problems", ok, len(failed))
     for serial, reason in failed:
         log.error("PROBLEM SUMMARY %s: %s", serial, reason)
-    log.info("Full log written to %s", log_file)
-    sys.exit(1 if failed else 0)
+    return 1 if failed else 0
+
+
+def main():
+    """Read the arguments, set up logging and run the steps."""
+    args = parse_arguments()
+    _, log_file = setup_logging("apply_aps", args.log_file, LOG_DIR)
+    log.info("=== Apply APs started%s ===", " (DRY RUN)" if args.dry_run else "")
+    if not sys.argv[1:]:
+        log.info("No arguments given, using DEBUG_ARGS from the top of this file: %s", DEBUG_ARGS)
+
+    exit_code = run_script(log, log_file, run, args)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

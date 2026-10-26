@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 import meraki
+import requests
 
 import resource_root.credentials.my_creds as cred
 
@@ -51,6 +52,45 @@ def setup_logging(name, log_file=None, log_dir=None):
     ch.setFormatter(fmt)
     log.addHandler(ch)
     return log, str(log_file)
+
+
+# --------------------------------------------------------------------------
+# Running a script
+# --------------------------------------------------------------------------
+class ScriptStopped(Exception):
+    """The script can't continue. The message explains why (no traceback needed)."""
+
+
+def run_script(log, log_file, run_function, *args):
+    """Call run_function(*args) and turn errors into a clear message + exit code.
+
+    Exit codes: 0 = OK, 1 = stopped or some items failed, 2 = unexpected error, 130 = Ctrl+C.
+    run_function returns its own exit code (None counts as 0).
+    """
+    try:
+        exit_code = run_function(*args) or 0
+    except ScriptStopped as exc:
+        # Expected problems: bad API key, missing network, unreadable file, ...
+        log.error("STOPPED: %s", exc)
+        exit_code = 1
+    except meraki.APIError as exc:
+        # An API call that the script didn't catch itself
+        log.error("STOPPED: Meraki API error in %s: %s", exc.operation, api_error_text(exc))
+        exit_code = 1
+    except requests.exceptions.RequestException as exc:
+        # No network, DNS, proxy or TLS problems (after the SDK's own retries)
+        log.error("STOPPED: Could not reach the Meraki API: %s", exc)
+        exit_code = 1
+    except KeyboardInterrupt:
+        log.warning("Stopped by user (Ctrl+C)")
+        exit_code = 130
+    except Exception:
+        # Anything we didn't expect: full traceback goes to the log file and console
+        log.exception("STOPPED: Unexpected error")
+        exit_code = 2
+
+    log.info("Full log written to %s", log_file)
+    return exit_code
 
 
 # --------------------------------------------------------------------------
@@ -101,12 +141,15 @@ def get_dashboard():
 
     All changes made through it are logged to CHANGE_LOG.
     """
-    dashboard = meraki.DashboardAPI(
-        cred.my_meraki_api_key,
-        suppress_logging=True,  # our own logging covers it, and the SDK log can be noisy
-        wait_on_rate_limit=True,
-        maximum_retries=5,
-    )
+    try:
+        dashboard = meraki.DashboardAPI(
+            cred.my_meraki_api_key,
+            suppress_logging=True,  # our own logging covers it, and the SDK log can be noisy
+            wait_on_rate_limit=True,
+            maximum_retries=5,
+        )
+    except meraki.APIKeyError as exc:
+        raise ScriptStopped(f"No Meraki API key found - check my_meraki_api_key in credentials ({exc})") from exc
     _log_changes(dashboard._session)
     return dashboard
 
@@ -129,12 +172,12 @@ def resolve_org_id(dashboard, org=None):
         for o in orgs:
             if str(o["id"]) == str(org) or o["name"] == org:
                 return o["id"]
-        raise SystemExit(f"Organization '{org}' not found among the {len(orgs)} this API key can access")
+        raise ScriptStopped(f"Organization '{org}' not found among the {len(orgs)} this API key can access")
 
     if len(orgs) == 1:
         return orgs[0]["id"]
     names = "\n".join(f"  {o['id']}  {o['name']}" for o in orgs)
-    raise SystemExit(f"The API key has access to several organizations, pick one with --org:\n{names}")
+    raise ScriptStopped(f"The API key has access to several organizations, pick one with --org:\n{names}")
 
 
 def get_networks_by_name(dashboard, org_id):

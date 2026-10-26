@@ -1,0 +1,4 @@
+serial number,mac address,subscription code,msp portal,tenant,site,group,template
+CNXXXXXXX1,AA:BB:CC:00:00:01,EXAMPLEKEY0001,MSP-EU,Customer A,Stockholm Office,Office-APs,AP-Template
+CNXXXXXXX2,aabb.cc00.0002,EXAMPLEKEY0001,MSP-EU,Customer A,,,
+CNXXXXXXX3,AA-BB-CC-00-00-03,EXAMPLEKEY0002,MSP-EU,Customer B,Gothenburg,,

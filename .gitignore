@@ -2,6 +2,14 @@
 resource_root/credentials/
 .env
 *.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+*credential*.json
+my_creds*.py
 
 # Python
 __pycache__/
@@ -17,3 +25,21 @@ venv/
 *.egg-info/
 build/
 dist/
+
+# Claude Code - personal/local only
+CLAUDE.local.md
+.claude/settings.local.json
+.mcp.json
+
+# Data exported from real Meraki networks (SSID names, site settings).
+# Hand-made templates directly in rf_profiles/ are still tracked.
+meraki_scripts/rf_profiles/*/
+logs/
+
+# Aruba: saved OAuth refresh tokens, and real device CSVs (they hold subscription codes).
+# The made-up example in aruba_scripts/examples/ is still tracked.
+*tokens*.json
+aruba_scripts/*.csv
+
+# Run configs with real site/network names stay local (the other .run/ configs use DEBUG_ARGS)
+.run/upload_rf_profile (debug, dry-run).run.xml
